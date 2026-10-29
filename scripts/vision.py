@@ -37,6 +37,10 @@ TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.2"))
 # Один зависший запрос блокировал очередь на десять минут: при деградации
 # скорости генерации таймаут в 600 секунд гарантированно вырабатывался целиком.
 LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "240"))
+# Images stay on Ollama. This vLLM path is text-only.
+LLM_BACKEND = os.environ.get("LLM_BACKEND", "ollama").strip().lower() or "ollama"
+VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
+VLLM_MODEL = os.environ.get("VLLM_MODEL", "").strip()
 
 DESCRIBE_PROMPT = (
     "Внимательно изучи изображение. Ответь на русском языке строго в таком формате:\n\n"
@@ -78,8 +82,7 @@ def _with_retry(call, what):
     raise last
 
 
-def ollama_chat(messages, images=None, model=None, num_predict=None, temperature=None):
-    """Запрос к Ollama /api/chat. think=False обязателен: модель рассуждающая."""
+def _ollama_chat_native(messages, images=None, model=None, num_predict=None, temperature=None):
     msgs = [dict(m) for m in messages]
     if images:
         msgs[-1]["images"] = images
@@ -106,13 +109,7 @@ def ollama_chat(messages, images=None, model=None, num_predict=None, temperature
     return re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
 
 
-def ollama_chat_stream(messages, model=None, num_predict=None, temperature=None, on_delta=None):
-    """То же, что ollama_chat, но с потоковой выдачей.
-
-    on_delta(накопленный_текст) вызывается по мере генерации — чтобы показывать
-    ответ в чате, пока модель ещё пишет. False из on_delta обрывает поток.
-    Возвращает полный текст.
-    """
+def _ollama_chat_stream_native(messages, model=None, num_predict=None, temperature=None, on_delta=None):
     options = {
         "temperature": TEMPERATURE if temperature is None else temperature,
         "num_predict": NUM_PREDICT if num_predict is None else num_predict,
@@ -174,15 +171,117 @@ def _log_ollama(body, first_s):
     )
 
 
+def _strip_think(text):
+    return re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+
+
+def _vllm_model(model):
+    return VLLM_MODEL or model or CHAT_MODEL
+
+
+def _vllm_body(messages, model, num_predict, temperature, stream):
+    return {
+        "model": _vllm_model(model),
+        "messages": [dict(m) for m in messages],
+        "stream": stream,
+        "max_tokens": NUM_PREDICT if num_predict is None else num_predict,
+        "temperature": TEMPERATURE if temperature is None else temperature,
+        # qwen3.6 returns empty content unless thinking is off
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+
+def _vllm_content(body):
+    choices = body.get("choices") or [{}]
+    message = (choices[0] or {}).get("message") or {}
+    return message.get("content") or ""
+
+
+def _vllm_delta(chunk):
+    choices = chunk.get("choices") or []
+    if not choices:
+        return ""
+    delta = (choices[0] or {}).get("delta") or {}
+    piece = delta.get("content")
+    return piece if isinstance(piece, str) else ""
+
+
+def _vllm_chat(messages, model=None, num_predict=None, temperature=None):
+    def call():
+        resp = requests.post(
+            f"{VLLM_BASE_URL}/chat/completions",
+            json=_vllm_body(messages, model, num_predict, temperature, False),
+            timeout=(15, LLM_TIMEOUT),
+        )
+        resp.raise_for_status()
+        return resp
+
+    return _strip_think(_vllm_content(_with_retry(call, "ответ").json()))
+
+
+def _vllm_chat_stream(messages, model=None, num_predict=None, temperature=None, on_delta=None):
+    parts = []
+
+    def open_stream():
+        return requests.post(
+            f"{VLLM_BASE_URL}/chat/completions",
+            json=_vllm_body(messages, model, num_predict, temperature, True),
+            timeout=(15, LLM_TIMEOUT),
+            stream=True,
+        )
+
+    with _with_retry(open_stream, "поток") as resp:
+        resp.raise_for_status()
+        for raw in resp.iter_lines(decode_unicode=True):
+            if not raw:
+                continue
+            line = raw.strip()
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if not line:
+                continue
+            if line == "[DONE]":
+                break
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            piece = _vllm_delta(chunk)
+            if not piece:
+                continue
+            parts.append(piece)
+            if on_delta:
+                try:
+                    keep = on_delta("".join(parts))
+                except Exception:
+                    keep = True
+                if keep is False:
+                    resp.close()
+                    break
+    return _strip_think("".join(parts))
+
+
+def ollama_chat(messages, images=None, model=None, num_predict=None, temperature=None):
+    if images or LLM_BACKEND != "vllm":
+        return _ollama_chat_native(messages, images, model, num_predict, temperature)
+    return _vllm_chat(messages, model, num_predict, temperature)
+
+
+def ollama_chat_stream(messages, model=None, num_predict=None, temperature=None, on_delta=None):
+    if LLM_BACKEND != "vllm":
+        return _ollama_chat_stream_native(messages, model, num_predict, temperature, on_delta)
+    return _vllm_chat_stream(messages, model, num_predict, temperature, on_delta)
+
+
 def describe_image(image_bytes, hint=""):
     """Разбор картинки, присланной пользователем: что на ней и какой текст."""
     prompt = DESCRIBE_PROMPT + (f"\n\nПользователь уточняет: {hint}" if hint else "")
-    return ollama_chat([{"role": "user", "content": prompt}],
-                       images=[base64.b64encode(image_bytes).decode()], model=VISION_MODEL)
+    return _ollama_chat_native([{"role": "user", "content": prompt}],
+                               images=[base64.b64encode(image_bytes).decode()], model=VISION_MODEL)
 
 
 def ocr_image(image_bytes, num_predict=700):
     """Текст со скриншота документации — для индексации в базу знаний."""
-    return ollama_chat([{"role": "user", "content": OCR_PROMPT}],
-                       images=[base64.b64encode(image_bytes).decode()],
-                       model=VISION_MODEL, num_predict=num_predict)
+    return _ollama_chat_native([{"role": "user", "content": OCR_PROMPT}],
+                               images=[base64.b64encode(image_bytes).decode()],
+                               model=VISION_MODEL, num_predict=num_predict)
